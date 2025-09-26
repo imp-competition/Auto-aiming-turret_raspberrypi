@@ -1,270 +1,107 @@
-from picamera2 import Picamera2
+# -*- coding: utf-8 -*-
+"""
+방법3: 픽셀 기반 각도 변환 + 틸트 보정 적용
+"""
+
 import cv2 as cv
 import numpy as np
-import time, math, serial
+import math
+import time
 
-# =========================================================
+# -------------------------------
 # 기본 설정
-# =========================================================
-HFOV_DEG = 66.0
-VFOV_DEG = 41.0
+# -------------------------------
 FRAME_W, FRAME_H = 1280, 720
-TARGET_FPS = 30
-MIRROR = True
+HFOV_DEG = 62.2
+VFOV_DEG = 48.8
 
-AREA_FRAC_MIN = 0.0003
-AREA_FRAC_MAX = 0.30
-CIRC_MIN = 0.80
+# 총구(화면 내 기준 좌표) [픽셀 단위]
+MUZZLE_PX = FRAME_W // 2
+MUZZLE_PY = FRAME_H // 2 + 100
 
-# 모폴로지
-OPEN_K = 5
-CLOSE_K = 7
-OPEN_ITERS = 1
-CLOSE_ITERS = 2
+# 서보 중심 및 제한
+SERVO_CENTER_PAN  = 1500
+SERVO_CENTER_TILT = 1500
+PAN_MIN, PAN_MAX  = 1100, 1900
+TILT_MIN, TILT_MAX = 1100, 1900
 
-# 추적/모터
-SMOOTH_ALPHA = 0.4
-MIN_MOVE_DEG = 1.0
-DEADZONE_PX  = 8
-RANGE_CM     = 200.0
-H_CM_PER_DEG = 1.32
-V_CM_PER_DEG = 1.32
-
-# UART
-UART_PAN  = '/dev/ttyAMA2'
-UART_TILT = '/dev/ttyAMA3'
-BAUDRATE  = 115200
-SER_TIMEOUT = 0.1
-
-# 서보
-SERVO_MIN = 0
-SERVO_MAX = 180
-SERVO_CENTER_PAN  = 90
-SERVO_CENTER_TILT = 90
 SIGN_PAN  = +1
-SIGN_TILT = -1
+SIGN_TILT = -1  # 틸트 서보 반전
 
-PAN_MIN,  PAN_MAX  = 0, 180
-TILT_MIN, TILT_MAX = 75, 180
+# [NEW] 틸트 보정 (도 단위) — 음수면 '내림'
+TILT_BIAS_DEG = -3.0
 
-# =========================================================
-# 총구 위치 (픽셀 좌표) — 카메라 영상 속 좌표
-# =========================================================
-MUZZLE_PX = 640   # 예: 중앙
-MUZZLE_PY = 600   # 예: 화면 하단 근처
+# -------------------------------
+# 유틸 함수
+# -------------------------------
+def draw_text(img, text, org, color=(0,255,0)):
+    cv.putText(img, text, org, cv.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv.LINE_AA)
 
-# =========================================================
-# 점수 가중치 (원형 + 색)
-# =========================================================
-W_CIRC  = 0.40
-W_COLOR = 0.60
-
-WC_H = 0.15
-WC_S = 0.65
-WC_V = 0.20
-
-# =========================================================
-# 목표 색 구간
-# =========================================================
-H_LO, H_HI = 3.0, 11.0
-S_LO, S_HI = 180.0, 199.0
-V_LO, V_HI = 175.0, 199.0
-
-H_SIGMA_OUT = 6.0
-S_SIGMA_OUT = 15.0
-V_SIGMA_OUT = 15.0
-
-# =========================================================
-# 마스크 생성
-# =========================================================
-def make_mask_from_bgr(frame_bgr, use_clahe=True):
-    hsv = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
-    if use_clahe:
-        h, s, v = cv.split(hsv)
-        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        v = clahe.apply(v)
-        hsv = cv.merge([h, s, v])
-    def or_ranges(hsv_img, ranges):
-        m = None
-        for lo, hi in ranges:
-            cur = cv.inRange(hsv_img, np.array(lo), np.array(hi))
-            m = cur if m is None else cv.bitwise_or(m, cur)
-        return m
-    red_bright = [((0,130,80),(15,255,255)), ((165,130,80),(180,255,255))]
-    red_dark   = [((0, 90,40),(15,255,255)), ((165, 90,40),(180,255,255))]
-    m_red = cv.bitwise_or(or_ranges(hsv, red_bright), or_ranges(hsv, red_dark))
-    mask = m_red
-    k_open  = cv.getStructuringElement(cv.MORPH_ELLIPSE, (OPEN_K, OPEN_K))
-    k_close = cv.getStructuringElement(cv.MORPH_ELLIPSE, (CLOSE_K, CLOSE_K))
-    mask = cv.morphologyEx(mask, cv.MORPH_OPEN,  k_open,  iterations=OPEN_ITERS)
-    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, k_close, iterations=CLOSE_ITERS)
-    return mask
-
-# =========================================================
-# 기하/보조
-# =========================================================
-def circularity_from_contour(cnt):
-    area = cv.contourArea(cnt)
-    perim = cv.arcLength(cnt, True)
-    if perim <= 0: return 0.0, area
-    circ = 4.0 * math.pi * area / (perim * perim)
-    return circ, area
-
-# 🔹 픽셀→각도 변환 (총구 기준)
-def px_to_deg_with_muzzle(target_px, target_py, muzzle_px, muzzle_py, width, height):
-    dx_px = target_px - muzzle_px
-    dy_px = target_py - muzzle_py
-    deg_x = (dx_px / float(width))  * HFOV_DEG
-    deg_y = (dy_px / float(height)) * VFOV_DEG
-    return deg_x, deg_y
-
-def angle_to_cm(deg_x, deg_y, range_cm):
-    dx_cm = range_cm * math.tan(math.radians(deg_x))
-    dy_cm = range_cm * math.tan(math.radians(deg_y))
-    return dx_cm, dy_cm
-
-def cm_to_motor_deg(dx_cm, dy_cm):
-    need_deg_x = dx_cm / H_CM_PER_DEG
-    need_deg_y = dy_cm / V_CM_PER_DEG
-    def quantize(v):
-        s = 1 if v >= 0 else -1
-        mag = abs(v)
-        if mag < MIN_MOVE_DEG: return 0
-        return int(round(s * mag))
-    return quantize(need_deg_x), quantize(need_deg_y)
-
-def mean_hsv_in_hull(frame_bgr, hull):
-    hsv = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
-    mask = np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
-    poly = hull.reshape(-1, 2)
-    cv.fillConvexPoly(mask, poly, 255)
-    m = mask > 0
-    if not np.any(m): return None
-    h, s, v = cv.split(hsv)
-    Hm = float(np.mean(h[m]))
-    Sm = float(np.mean(s[m]))
-    Vm = float(np.mean(v[m]))
-    return (Hm, Sm, Vm)
-
-def band_score(val, lo, hi, sigma_out):
-    if lo <= val <= hi: return 1.0
-    if val < lo: d = lo - val
-    else: d = val - hi
-    return math.exp(-0.5 * (d / max(1e-6, sigma_out))**2)
-
-def color_score_band(Hm, Sm, Vm):
-    scH = band_score(Hm, H_LO, H_HI, H_SIGMA_OUT)
-    scS = band_score(Sm, S_LO, S_HI, S_SIGMA_OUT)
-    scV = band_score(Vm, V_LO, V_HI, V_SIGMA_OUT)
-    num = WC_H*scH + WC_S*scS + WC_V*scV
-    den = WC_H + WC_S + WC_V
-    return max(0.0, min(1.0, num/den)), (scH, scS, scV)
-
-def pick_best_target(mask, frame_area_min, frame_area_max, circ_min, frame_bgr=None):
-    cnts, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    best = None
-    for c in cnts:
-        hull = cv.convexHull(c)
-        circ, area = circularity_from_contour(hull)
-        if area < frame_area_min or area > frame_area_max: continue
-        if circ < circ_min: continue
-        M = cv.moments(hull)
-        if M["m00"] == 0: continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        hsv_mean = None; col_sc = 0.0; scH=scS=scV=0.0
-        if frame_bgr is not None:
-            hsv_mean = mean_hsv_in_hull(frame_bgr, hull)
-            if hsv_mean is not None:
-                Hm, Sm, Vm = hsv_mean
-                col_sc, (scH, scS, scV) = color_score_band(Hm, Sm, Vm)
-        total_sc = (W_CIRC * circ) + (W_COLOR * col_sc)
-        cand = {
-            "score": total_sc, "score_breakdown": {"circ": circ, "color": col_sc, "H": scH, "S": scS, "V": scV},
-            "circularity": circ, "area": int(area), "center": (cx, cy), "hull": hull, "hsv_mean": hsv_mean,
-        }
-        if (best is None) or (cand["score"] > best["score"]): best = cand
-    return best
-
-def delta_to_servo_angles(cmd_deg_x, cmd_deg_y):
+def delta_to_servo_angles(cmd_deg_x, cmd_deg_y, tilt_bias_deg=0.0):
     pan  = SERVO_CENTER_PAN  + SIGN_PAN  * cmd_deg_x
     tilt = SERVO_CENTER_TILT + SIGN_TILT * cmd_deg_y
+
+    # [NEW] 틸트 bias 적용
+    tilt = tilt + int(round(tilt_bias_deg))
+
     pan  = max(PAN_MIN,  min(PAN_MAX,  int(pan)))
     tilt = max(TILT_MIN, min(TILT_MAX, int(tilt)))
     return pan, tilt
 
-# =========================================================
-# UART
-# =========================================================
-class MotorUART:
-    def __init__(self, port_pan, port_tilt, baud, timeout):
-        self.ser_pan  = serial.Serial(port_pan,  baud, timeout=timeout)
-        self.ser_tilt = serial.Serial(port_tilt, baud, timeout=timeout)
-        time.sleep(0.2)
-        self.last_pan_angle  = None
-        self.last_tilt_angle = None
-    def send_servo(self, pan_angle, tilt_angle):
-        pan_angle  = max(PAN_MIN,  min(PAN_MAX,  int(pan_angle)))
-        tilt_angle = max(TILT_MIN, min(TILT_MAX, int(tilt_angle)))
-        if pan_angle != self.last_pan_angle:
-            self.ser_pan.write(f"{pan_angle}\n".encode('ascii'))
-            self.last_pan_angle = pan_angle
-        if tilt_angle != self.last_tilt_angle:
-            self.ser_tilt.write(f"{tilt_angle}\n".encode('ascii'))
-            self.last_tilt_angle = tilt_angle
-    def close(self):
-        for s in (self.ser_pan, self.ser_tilt):
-            try: s.close()
-            except: pass
-
-# =========================================================
+# -------------------------------
 # 메인
-# =========================================================
-def main():
-    motors = MotorUART(UART_PAN, UART_TILT, BAUDRATE, SER_TIMEOUT)
-    picam2 = Picamera2()
-    config = picam2.create_preview_configuration(main={"size": (FRAME_W, FRAME_H)})
-    picam2.configure(config); picam2.start()
-    frame_area = FRAME_W * FRAME_H
-    AREA_MIN = int(AREA_FRAC_MIN * frame_area)
-    AREA_MAX = int(AREA_FRAC_MAX * frame_area)
-    prev_t = time.time(); fps = 0.0
+# -------------------------------
+cap = cv.VideoCapture(0)
+if not cap.isOpened():
+    print("Camera open failed")
+    exit()
 
-    try:
-        while True:
-            frame_rgb = picam2.capture_array()
-            frame = cv.cvtColor(frame_rgb, cv.COLOR_RGB2BGR)
-            if MIRROR: frame = cv.flip(frame, 1)
-            mask = make_mask_from_bgr(frame, use_clahe=True)
-            target = pick_best_target(mask, AREA_MIN, AREA_MAX, CIRC_MIN, frame_bgr=frame)
-            vis = frame.copy()
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-            # 총구 위치 표시
-            cv.drawMarker(vis, (MUZZLE_PX, MUZZLE_PY), (0,255,255), markerType=cv.MARKER_TILTED_CROSS, markerSize=24, thickness=2)
+    vis = frame.copy()
 
-            if target is not None:
-                cx, cy = target["center"]
-                deg_x, deg_y = px_to_deg_with_muzzle(cx, cy, MUZZLE_PX, MUZZLE_PY, FRAME_W, FRAME_H)
-                dx_cm, dy_cm = angle_to_cm(deg_x, deg_y, RANGE_CM)
-                cmd_deg_x, cmd_deg_y = cm_to_motor_deg(dx_cm, dy_cm)
-                servo_pan, servo_tilt = delta_to_servo_angles(cmd_deg_x, cmd_deg_y)
-                motors.send_servo(servo_pan, servo_tilt)
-                cv.circle(vis, (cx, cy), 6, (0,0,255), -1)
-                cv.putText(vis, f"deg_x={deg_x:.2f}, deg_y={deg_y:.2f}", (10,30), cv.FONT_HERSHEY_SIMPLEX, 0.6,(0,255,0),2)
-                cv.putText(vis, f"servo pan={servo_pan}, tilt={servo_tilt}", (10,60), cv.FONT_HERSHEY_SIMPLEX, 0.6,(0,255,255),2)
-            else:
-                cv.putText(vis, "No target", (10,30), cv.FONT_HERSHEY_SIMPLEX, 0.8,(0,0,255),2)
+    # 예시: 임시 타겟 = 화면 중심
+    target_cx, target_cy = FRAME_W//2, FRAME_H//2
 
-            now = time.time(); dt = now - prev_t; prev_t = now
-            if dt>0: fps = 0.9*fps + 0.1*(1.0/dt) if fps>0 else (1.0/dt)
-            cv.putText(vis, f"FPS:{fps:.1f}", (10, FRAME_H-10), cv.FONT_HERSHEY_SIMPLEX, 0.7,(255,255,0),2)
-            cv.imshow("frame", vis); cv.imshow("mask", mask)
-            key = cv.waitKey(1)&0xFF
-            if key==27 or key==ord('q'): break
-    except KeyboardInterrupt:
-        print("Interrupted.")
-    finally:
-        cv.destroyAllWindows(); picam2.stop(); motors.close()
+    # muzzle 대비 픽셀 오프셋
+    dx_px = target_cx - MUZZLE_PX
+    dy_px = target_cy - MUZZLE_PY
 
-if __name__ == "__main__":
-    main()
+    # 픽셀 → 각도 변환 (방법3: 단순 비례식)
+    cmd_deg_x = (dx_px / float(FRAME_W)) * HFOV_DEG
+    cmd_deg_y = (dy_px / float(FRAME_H)) * VFOV_DEG
+
+    # 서보 값 계산 (bias 적용)
+    servo_pan, servo_tilt = delta_to_servo_angles(cmd_deg_x, cmd_deg_y, tilt_bias_deg=TILT_BIAS_DEG)
+
+    # [TODO] 실제 서보 출력: motors.send_servo(servo_pan, servo_tilt)
+
+    # HUD 표시
+    draw_text(vis, f"DX_px:{dx_px:+d}, DY_px:{dy_px:+d}", (20,30))
+    draw_text(vis, f"CMD_deg_x:{cmd_deg_x:+.1f}, CMD_deg_y:{cmd_deg_y:+.1f}", (20,60))
+    draw_text(vis, f"ServoPan:{servo_pan}, ServoTilt:{servo_tilt}", (20,90))
+    draw_text(vis, f"TILT_BIAS: {TILT_BIAS_DEG:+.1f} deg", (FRAME_W-260,30))  # [NEW]
+
+    cv.imshow("aim", vis)
+
+    # 키 입력 처리
+    key = cv.waitKey(1) & 0xFF
+    if key == 27 or key == ord('q'):
+        break
+    elif key == ord('j'):   # [NEW] tilt 내려감
+        TILT_BIAS_DEG -= 1.0
+    elif key == ord('k'):   # [NEW] tilt 올라감
+        TILT_BIAS_DEG += 1.0
+    elif key == ord('0'):   # [NEW] bias 리셋
+        TILT_BIAS_DEG = 0.0
+    elif key == ord('c'):   # [NEW] 자동 캘리브레이션 (간단)
+        dy_px = target_cy - MUZZLE_PY
+        deg_y = (dy_px / float(FRAME_H)) * VFOV_DEG
+        TILT_BIAS_DEG = -deg_y
+        print(f"Auto calib: dy_px={dy_px}, deg_y={deg_y:.2f} => bias={TILT_BIAS_DEG:.2f}")
+
+cap.release()
+cv.destroyAllWindows()
