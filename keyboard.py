@@ -26,15 +26,15 @@ OPEN_ITERS = 1
 CLOSE_ITERS = 2
 
 # 추적/모터 기본
-SMOOTH_ALPHA = 0.4       # 타깃 중심 EMA
-MIN_MOVE_DEG = 1.0       # 1도 미만이면 구동 안함(헌팅 방지)
-DEADZONE_PX  = 8         # 총구 기준 데드존(픽셀)
+SMOOTH_ALPHA = 0.40     # 타깃 중심 EMA (스무딩; 0~1)
+MIN_MOVE_DEG = 1.0      # 1도 미만은 구동 안함(헌팅 방지)
+DEADZONE_PX  = 8        # 총구 기준 데드존(픽셀)
 RANGE_CM     = 200.0
 H_CM_PER_DEG = 1.32
 V_CM_PER_DEG = 1.32
 
 # ===== 실시간 튜닝 파라미터 =====
-Kp = 1.00            # 위치 오차(각도기반 명령) 비례 이득
+Kp = 1.00            # 위치 오차(각도 기반 명령) 비례 이득
 Kv = 0.30            # 타깃 각속도(deg/s) 부스트 이득
 MAX_STEP_DEG = 8     # 프레임당 최대 구동각 제한(°)
 ALPHA_V = 0.6        # 속도 추정 EMA
@@ -75,8 +75,8 @@ PAN_OFFSET  = PAN_OFFSET_INIT
 TILT_OFFSET = TILT_OFFSET_INIT
 ADJ_STEP    = 1      # 한 번 누를 때 오프셋 변화(°)
 
-# 선택: 영점/스텝 저장 파일
-SETTINGS = "/home/pi/zero_offsets.json"  # 환경에 맞게 경로 조정
+# 선택: 영점/튜닝 저장 파일
+SETTINGS = "/home/pi/zero_offsets.json"  # 경로 조정 가능
 
 # ==============================
 # 타깃 스코어(원형+색)
@@ -311,15 +311,20 @@ def main():
     AREA_MIN = int(AREA_FRAC_MIN * frame_area)
     AREA_MAX = int(AREA_FRAC_MAX * frame_area)
 
-    # 상태 변수들
     ema_cx = ema_cy = None
     prev_t = time.time()
     fps = 0.0
+
     # 속도 추정 상태
     prev_deg_x = None
     prev_deg_y = None
     v_deg_x = 0.0
     v_deg_y = 0.0
+
+    # 스무딩 프리셋 (숫자 0으로 순환)
+    smoothing_presets = [0.20, 0.35, 0.50, 0.65, 0.80]
+    smooth_idx = min(range(len(smoothing_presets)),
+                     key=lambda i: abs(smoothing_presets[i]-SMOOTH_ALPHA))
 
     try:
         while True:
@@ -352,7 +357,7 @@ def main():
                 circ = target["circularity"]
                 hull = target["hull"]
 
-                # EMA로 타깃 중심 매끈화
+                # EMA로 타깃 중심 매끈화 (스무딩)
                 if ema_cx is None:
                     ema_cx, ema_cy = cx, cy
                 else:
@@ -380,12 +385,16 @@ def main():
                 # 거리 환산(정보표시용)
                 dx_cm, dy_cm = angle_to_cm(deg_x, deg_y, RANGE_CM)
 
-                # 위치기반 필요각(기존 경로) -> cm->deg 변환된 정수 명령과 유사한 척도 사용
-                cmd_deg_x_pos, cmd_deg_y_pos = cm_to_motor_deg(dx_cm, dy_cm)
+                # 위치기반 필요각(정수화 경로와 척도 맞춤)
+                def pos_cmd_from_cm(dx_cm, dy_cm):
+                    need_x = dx_cm / H_CM_PER_DEG
+                    need_y = dy_cm / V_CM_PER_DEG
+                    return need_x, need_y
+                need_x, need_y = pos_cmd_from_cm(dx_cm, dy_cm)
 
                 # --- 위치 + 속도 피드포워드 결합 ---
-                cmd_x = Kp * cmd_deg_x_pos + Kv * v_deg_x
-                cmd_y = Kp * cmd_deg_y_pos + Kv * v_deg_y
+                cmd_x = Kp * need_x + Kv * v_deg_x
+                cmd_y = Kp * need_y + Kv * v_deg_y
 
                 # 프레임당 최대 구동각 제한
                 cmd_x = max(-MAX_STEP_DEG, min(MAX_STEP_DEG, cmd_x))
@@ -429,18 +438,6 @@ def main():
                 draw_text(vis, f"servo_out:      pan={servo_pan:3d}°, tilt={servo_tilt:3d}°",
                           (10, y0+4*dyy), color=(0,255,255))
 
-                if target["hsv_mean"] is not None:
-                    Hm, Sm, Vm = target["hsv_mean"]
-                    scb = target["score_breakdown"]
-                    draw_text(vis, f"HSV(mean): H={Hm:.2f}, S={Sm:.2f}, V={Vm:.2f}",
-                              (10, y0+5*dyy), color=(200,255,200))
-                    draw_text(vis, f"Band H[{H_LO:.0f},{H_HI:.0f}] S[{S_LO:.0f},{S_HI:.0f}] V[{V_LO:.0f},{V_HI:.0f}]",
-                              (10, y0+6*dyy), color=(255,255,255), scale=0.62)
-                    draw_text(vis, f"color(H,S,V)=({scb['H']:.3f},{scb['S']:.3f},{scb['V']:.3f}) => color={scb['color']:.3f}",
-                              (10, y0+7*dyy), color=(200,255,200), scale=0.62)
-                    draw_text(vis, f"total={W_CIRC:.2f}*circ({scb['circ']:.3f}) + {W_COLOR:.2f}*color({scb['color']:.3f}) = {target['score']:.3f}",
-                              (10, y0+8*dyy), color=(255,255,0), scale=0.62)
-
             else:
                 ema_cx = ema_cy = None
                 draw_text(vis, "No target", (10, 30), color=(0,0,255), scale=0.8)
@@ -451,8 +448,8 @@ def main():
 
             draw_text(vis, f"ZERO pan:{PAN_OFFSET:+d}° tilt:{TILT_OFFSET:+d}° (step={ADJ_STEP}°)",
                       (FRAME_W - 500, FRAME_H - 32), color=(200,200,255), scale=0.6)
-            draw_text(vis, f"Kp:{Kp:.2f} Kv:{Kv:.2f} MAX:{MAX_STEP_DEG}°  DZ:{DEADZONE_PX}px  MIN:{MIN_MOVE_DEG:.1f}°  αv:{ALPHA_V:.2f}",
-                      (FRAME_W - 680, FRAME_H - 60), color=(200,220,255), scale=0.6)
+            draw_text(vis, f"Kp:{Kp:.2f} Kv:{Kv:.2f} MAX:{MAX_STEP_DEG}°  DZ:{DEADZONE_PX}px  MIN:{MIN_MOVE_DEG:.1f}°  α:{SMOOTH_ALPHA:.2f}",
+                      (FRAME_W - 690, FRAME_H - 60), color=(200,220,255), scale=0.6)
 
             cv.imshow("frame", vis)
             cv.imshow("mask",  mask)
@@ -462,52 +459,45 @@ def main():
                 break
 
             # ---- 키 입력: 영점 미세조정 ----
-            if   key in (ord('u'), ord('U')):
-                TILT_OFFSET -= ADJ_STEP
-                print(f"[OFFSET] TILT_OFFSET -> {TILT_OFFSET}")
-            elif key in (ord('d'), ord('D')):
-                TILT_OFFSET += ADJ_STEP
-                print(f"[OFFSET] TILT_OFFSET -> {TILT_OFFSET}")
-            elif key in (ord('r'), ord('R')):
-                PAN_OFFSET  += ADJ_STEP
-                print(f"[OFFSET] PAN_OFFSET  -> {PAN_OFFSET}")
-            elif key in (ord('l'), ord('L')):
-                PAN_OFFSET  -= ADJ_STEP
-                print(f"[OFFSET] PAN_OFFSET  -> {PAN_OFFSET}")
-            elif key in (ord('c'), ord('C')):
+            if   key == ord('u'):
+                TILT_OFFSET -= ADJ_STEP; print(f"[OFFSET] TILT_OFFSET -> {TILT_OFFSET}")
+            elif key == ord('d'):
+                TILT_OFFSET += ADJ_STEP; print(f"[OFFSET] TILT_OFFSET -> {TILT_OFFSET}")
+            elif key == ord('r'):
+                PAN_OFFSET  += ADJ_STEP;  print(f"[OFFSET] PAN_OFFSET  -> {PAN_OFFSET}")
+            elif key == ord('l'):
+                PAN_OFFSET  -= ADJ_STEP;  print(f"[OFFSET] PAN_OFFSET  -> {PAN_OFFSET}")
+            elif key == ord('c'):
                 PAN_OFFSET, TILT_OFFSET = PAN_OFFSET_INIT, TILT_OFFSET_INIT
                 print("[OFFSET] reset to initial:", PAN_OFFSET, TILT_OFFSET)
 
-            # ---- 키 입력: 실시간 튜닝 ----
+            # ---- 키 입력: 숫자만으로 튜닝 ----
             elif key == ord('1'):   # Kp down
                 Kp = max(0.0, round(Kp - STEP_K, 3)); print(f"[TUNE] Kp = {Kp:.3f}")
-            elif key == ord('!'):   # Kp up (Shift+1)
+            elif key == ord('2'):   # Kp up
                 Kp = round(Kp + STEP_K, 3); print(f"[TUNE] Kp = {Kp:.3f}")
 
-            elif key == ord('2'):   # Kv down
+            elif key == ord('3'):   # Kv down
                 Kv = max(0.0, round(Kv - STEP_K, 3)); print(f"[TUNE] Kv = {Kv:.3f}")
-            elif key == ord('@'):   # Kv up (Shift+2)
+            elif key == ord('4'):   # Kv up
                 Kv = round(Kv + STEP_K, 3); print(f"[TUNE] Kv = {Kv:.3f}")
 
-            elif key == ord('3'):   # MAX_STEP_DEG up
-                MAX_STEP_DEG = min(30, MAX_STEP_DEG + 1); print(f"[TUNE] MAX_STEP_DEG = {MAX_STEP_DEG}")
-            elif key == ord('#'):   # MAX_STEP_DEG down (환경에 따라 인식 안될 수 있음)
+            elif key == ord('5'):   # MAX_STEP_DEG down
                 MAX_STEP_DEG = max(1, MAX_STEP_DEG - 1); print(f"[TUNE] MAX_STEP_DEG = {MAX_STEP_DEG}")
+            elif key == ord('6'):   # MAX_STEP_DEG up
+                MAX_STEP_DEG = min(30, MAX_STEP_DEG + 1); print(f"[TUNE] MAX_STEP_DEG = {MAX_STEP_DEG}")
 
-            elif key == ord('z'):   # DEADZONE_PX down
+            elif key == ord('7'):   # DEADZONE_PX down
                 DEADZONE_PX = max(0, DEADZONE_PX - STEP_DZ); print(f"[TUNE] DEADZONE_PX = {DEADZONE_PX}")
-            elif key == ord('Z'):   # DEADZONE_PX up
+            elif key == ord('8'):   # DEADZONE_PX up
                 DEADZONE_PX = DEADZONE_PX + STEP_DZ; print(f"[TUNE] DEADZONE_PX = {DEADZONE_PX}")
 
-            elif key == ord('m'):   # MIN_MOVE_DEG down
+            elif key == ord('9'):   # MIN_MOVE_DEG down
                 MIN_MOVE_DEG = max(0.0, round(MIN_MOVE_DEG - STEP_MINMOVE, 2)); print(f"[TUNE] MIN_MOVE_DEG = {MIN_MOVE_DEG:.2f}")
-            elif key == ord('M'):   # MIN_MOVE_DEG up
-                MIN_MOVE_DEG = round(MIN_MOVE_DEG + STEP_MINMOVE, 2); print(f"[TUNE] MIN_MOVE_DEG = {MIN_MOVE_DEG:.2f}")
-
-            elif key == ord(','):   # 스무딩 강(EMA up)
-                SMOOTH_ALPHA = min(0.99, round(SMOOTH_ALPHA + 0.05, 2)); print(f"[TUNE] SMOOTH_ALPHA = {SMOOTH_ALPHA:.2f}")
-            elif key == ord('.'):   # 스무딩 약(EMA down)
-                SMOOTH_ALPHA = max(0.0, round(SMOOTH_ALPHA - 0.05, 2)); print(f"[TUNE] SMOOTH_ALPHA = {SMOOTH_ALPHA:.2f}")
+            elif key == ord('0'):   # 스무딩 프리셋 순환
+                smooth_idx = (smooth_idx + 1) % len(smoothing_presets)
+                SMOOTH_ALPHA = smoothing_presets[smooth_idx]
+                print(f"[TUNE] SMOOTH_ALPHA = {SMOOTH_ALPHA:.2f}")
 
             # ---- 오프셋/스텝 저장/로드 (선택) ----
             elif key == ord('['):   # ADJ_STEP down
