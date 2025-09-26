@@ -2,13 +2,7 @@
 # Aut0-du5t-Sensor
 # hello-world
 
-1 Kp ↓, 2 Kp ↑
 
-3 Kv ↓, 4 Kv ↑
 
-5 MAX_STEP_DEG ↓, 6 ↑
-
-7 DEADZONE_PX ↓, 8 ↑
-
-9 MIN_MOVE_DEG ↓, 0 스무딩 α(EMA) 프리셋 순환 (0.20 → 0.35 → 0.50 → 0.65 → 0.80 → …)
+<img width="929" height="564" alt="image" src="https://github.com/user-attachments/assets/06d310f0-fe05-4198-9112-1fe97e9c7698" />
 
