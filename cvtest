@@ -1,26 +1,28 @@
 from picamera2 import Picamera2
 import cv2 as cv
 import numpy as np
-import time
-import math
-import serial
+import time, math, serial
 
-# ---------- Config ----------
+# =========================================================
+# 기본 설정
+# =========================================================
 HFOV_DEG = 66.0
 VFOV_DEG = 41.0
 FRAME_W, FRAME_H = 1280, 720
 TARGET_FPS = 30
 MIRROR = True
 
-AREA_FRAC_MIN = 0.0005
-AREA_FRAC_MAX = 0.20
-CIRC_MIN = 0.90
+AREA_FRAC_MIN = 0.0003
+AREA_FRAC_MAX = 0.30
+CIRC_MIN = 0.80
 
+# 모폴로지
 OPEN_K = 5
 CLOSE_K = 7
 OPEN_ITERS = 1
 CLOSE_ITERS = 2
 
+# 추적/모터
 SMOOTH_ALPHA = 0.4
 MIN_MOVE_DEG = 1.0
 DEADZONE_PX  = 8
@@ -28,11 +30,13 @@ RANGE_CM     = 200.0
 H_CM_PER_DEG = 1.32
 V_CM_PER_DEG = 1.32
 
+# UART
 UART_PAN  = '/dev/ttyAMA2'
 UART_TILT = '/dev/ttyAMA3'
 BAUDRATE  = 115200
 SER_TIMEOUT = 0.1
 
+# 서보
 SERVO_MIN = 0
 SERVO_MAX = 180
 SERVO_CENTER_PAN  = 90
@@ -43,70 +47,73 @@ SIGN_TILT = -1
 PAN_MIN,  PAN_MAX  = 0, 180
 TILT_MIN, TILT_MAX = 75, 180
 
-# ★ 서보 기준 정조준 보정값
-PAN_OFFSET  = 119
-TILT_OFFSET = 98
+# =========================================================
+# 총구 위치 (픽셀 좌표) — 카메라 영상 속 좌표
+# =========================================================
+MUZZLE_PX = 640   # 예: 중앙
+MUZZLE_PY = 600   # 예: 화면 하단 근처
 
-# ---------- Color masking ----------
+# =========================================================
+# 점수 가중치 (원형 + 색)
+# =========================================================
+W_CIRC  = 0.40
+W_COLOR = 0.60
+
+WC_H = 0.15
+WC_S = 0.65
+WC_V = 0.20
+
+# =========================================================
+# 목표 색 구간
+# =========================================================
+H_LO, H_HI = 3.0, 11.0
+S_LO, S_HI = 180.0, 199.0
+V_LO, V_HI = 175.0, 199.0
+
+H_SIGMA_OUT = 6.0
+S_SIGMA_OUT = 15.0
+V_SIGMA_OUT = 15.0
+
+# =========================================================
+# 마스크 생성
+# =========================================================
 def make_mask_from_bgr(frame_bgr, use_clahe=True):
     hsv = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
-
     if use_clahe:
         h, s, v = cv.split(hsv)
         clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         v = clahe.apply(v)
         hsv = cv.merge([h, s, v])
-
     def or_ranges(hsv_img, ranges):
         m = None
         for lo, hi in ranges:
             cur = cv.inRange(hsv_img, np.array(lo), np.array(hi))
             m = cur if m is None else cv.bitwise_or(m, cur)
         return m
-
     red_bright = [((0,130,80),(15,255,255)), ((165,130,80),(180,255,255))]
     red_dark   = [((0, 90,40),(15,255,255)), ((165, 90,40),(180,255,255))]
     m_red = cv.bitwise_or(or_ranges(hsv, red_bright), or_ranges(hsv, red_dark))
-
+    mask = m_red
     k_open  = cv.getStructuringElement(cv.MORPH_ELLIPSE, (OPEN_K, OPEN_K))
     k_close = cv.getStructuringElement(cv.MORPH_ELLIPSE, (CLOSE_K, CLOSE_K))
-    mask = cv.morphologyEx(m_red, cv.MORPH_OPEN,  k_open,  iterations=OPEN_ITERS)
+    mask = cv.morphologyEx(mask, cv.MORPH_OPEN,  k_open,  iterations=OPEN_ITERS)
     mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, k_close, iterations=CLOSE_ITERS)
     return mask
 
-# ---------- Geometry/selection ----------
+# =========================================================
+# 기하/보조
+# =========================================================
 def circularity_from_contour(cnt):
     area = cv.contourArea(cnt)
     perim = cv.arcLength(cnt, True)
-    if perim <= 0:
-        return 0.0, area
+    if perim <= 0: return 0.0, area
     circ = 4.0 * math.pi * area / (perim * perim)
     return circ, area
 
-def pick_best_target(mask, frame_area_min, frame_area_max, circ_min):
-    cnts, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    best = None
-    for c in cnts:
-        hull = cv.convexHull(c)
-        circ, area = circularity_from_contour(hull)
-        if area < frame_area_min or area > frame_area_max:
-            continue
-        if circ < circ_min:
-            continue
-        x, y, w, h = cv.boundingRect(hull)
-        M = cv.moments(hull)
-        if M["m00"] == 0:
-            continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        cand = {"score": circ, "circularity": circ, "area": int(area),
-                "bbox": (x, y, w, h), "center": (cx, cy), "hull": hull}
-        if (best is None) or (cand["score"] > best["score"]) or \
-           (abs(cand["score"] - best["score"]) < 1e-6 and cand["area"] > best["area"]):
-            best = cand
-    return best
-
-def px_to_deg(dx_px, dy_px, width, height):
+# 🔹 픽셀→각도 변환 (총구 기준)
+def px_to_deg_with_muzzle(target_px, target_py, muzzle_px, muzzle_py, width, height):
+    dx_px = target_px - muzzle_px
+    dy_px = target_py - muzzle_py
     deg_x = (dx_px / float(width))  * HFOV_DEG
     deg_y = (dy_px / float(height)) * VFOV_DEG
     return deg_x, deg_y
@@ -122,10 +129,62 @@ def cm_to_motor_deg(dx_cm, dy_cm):
     def quantize(v):
         s = 1 if v >= 0 else -1
         mag = abs(v)
-        if mag < MIN_MOVE_DEG:
-            return 0
+        if mag < MIN_MOVE_DEG: return 0
         return int(round(s * mag))
     return quantize(need_deg_x), quantize(need_deg_y)
+
+def mean_hsv_in_hull(frame_bgr, hull):
+    hsv = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
+    mask = np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
+    poly = hull.reshape(-1, 2)
+    cv.fillConvexPoly(mask, poly, 255)
+    m = mask > 0
+    if not np.any(m): return None
+    h, s, v = cv.split(hsv)
+    Hm = float(np.mean(h[m]))
+    Sm = float(np.mean(s[m]))
+    Vm = float(np.mean(v[m]))
+    return (Hm, Sm, Vm)
+
+def band_score(val, lo, hi, sigma_out):
+    if lo <= val <= hi: return 1.0
+    if val < lo: d = lo - val
+    else: d = val - hi
+    return math.exp(-0.5 * (d / max(1e-6, sigma_out))**2)
+
+def color_score_band(Hm, Sm, Vm):
+    scH = band_score(Hm, H_LO, H_HI, H_SIGMA_OUT)
+    scS = band_score(Sm, S_LO, S_HI, S_SIGMA_OUT)
+    scV = band_score(Vm, V_LO, V_HI, V_SIGMA_OUT)
+    num = WC_H*scH + WC_S*scS + WC_V*scV
+    den = WC_H + WC_S + WC_V
+    return max(0.0, min(1.0, num/den)), (scH, scS, scV)
+
+def pick_best_target(mask, frame_area_min, frame_area_max, circ_min, frame_bgr=None):
+    cnts, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    best = None
+    for c in cnts:
+        hull = cv.convexHull(c)
+        circ, area = circularity_from_contour(hull)
+        if area < frame_area_min or area > frame_area_max: continue
+        if circ < circ_min: continue
+        M = cv.moments(hull)
+        if M["m00"] == 0: continue
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        hsv_mean = None; col_sc = 0.0; scH=scS=scV=0.0
+        if frame_bgr is not None:
+            hsv_mean = mean_hsv_in_hull(frame_bgr, hull)
+            if hsv_mean is not None:
+                Hm, Sm, Vm = hsv_mean
+                col_sc, (scH, scS, scV) = color_score_band(Hm, Sm, Vm)
+        total_sc = (W_CIRC * circ) + (W_COLOR * col_sc)
+        cand = {
+            "score": total_sc, "score_breakdown": {"circ": circ, "color": col_sc, "H": scH, "S": scS, "V": scV},
+            "circularity": circ, "area": int(area), "center": (cx, cy), "hull": hull, "hsv_mean": hsv_mean,
+        }
+        if (best is None) or (cand["score"] > best["score"]): best = cand
+    return best
 
 def delta_to_servo_angles(cmd_deg_x, cmd_deg_y):
     pan  = SERVO_CENTER_PAN  + SIGN_PAN  * cmd_deg_x
@@ -134,7 +193,9 @@ def delta_to_servo_angles(cmd_deg_x, cmd_deg_y):
     tilt = max(TILT_MIN, min(TILT_MAX, int(tilt)))
     return pan, tilt
 
-# ---------- UART helpers ----------
+# =========================================================
+# UART
+# =========================================================
 class MotorUART:
     def __init__(self, port_pan, port_tilt, baud, timeout):
         self.ser_pan  = serial.Serial(port_pan,  baud, timeout=timeout)
@@ -142,7 +203,6 @@ class MotorUART:
         time.sleep(0.2)
         self.last_pan_angle  = None
         self.last_tilt_angle = None
-
     def send_servo(self, pan_angle, tilt_angle):
         pan_angle  = max(PAN_MIN,  min(PAN_MAX,  int(pan_angle)))
         tilt_angle = max(TILT_MIN, min(TILT_MAX, int(tilt_angle)))
@@ -152,124 +212,59 @@ class MotorUART:
         if tilt_angle != self.last_tilt_angle:
             self.ser_tilt.write(f"{tilt_angle}\n".encode('ascii'))
             self.last_tilt_angle = tilt_angle
-
     def close(self):
         for s in (self.ser_pan, self.ser_tilt):
-            try:
-                s.close()
-            except:
-                pass
+            try: s.close()
+            except: pass
 
-# ---------- Main ----------
+# =========================================================
+# 메인
+# =========================================================
 def main():
     motors = MotorUART(UART_PAN, UART_TILT, BAUDRATE, SER_TIMEOUT)
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(main={"size": (FRAME_W, FRAME_H)})
-    picam2.configure(config)
-    picam2.start()
-
-    cx0, cy0 = FRAME_W // 2, FRAME_H // 2
-    ema_cx, ema_cy = None, None
-
+    picam2.configure(config); picam2.start()
     frame_area = FRAME_W * FRAME_H
     AREA_MIN = int(AREA_FRAC_MIN * frame_area)
     AREA_MAX = int(AREA_FRAC_MAX * frame_area)
-
-    prev_t = time.time()
-    fps = 0.0
+    prev_t = time.time(); fps = 0.0
 
     try:
         while True:
             frame_rgb = picam2.capture_array()
             frame = cv.cvtColor(frame_rgb, cv.COLOR_RGB2BGR)
-            if MIRROR:
-                frame = cv.flip(frame, 1)
-
+            if MIRROR: frame = cv.flip(frame, 1)
             mask = make_mask_from_bgr(frame, use_clahe=True)
-            target = pick_best_target(mask, AREA_MIN, AREA_MAX, CIRC_MIN)
-
+            target = pick_best_target(mask, AREA_MIN, AREA_MAX, CIRC_MIN, frame_bgr=frame)
             vis = frame.copy()
-            cv.drawMarker(vis, (cx0, cy0), (255, 255, 255), markerType=cv.MARKER_CROSS, markerSize=24, thickness=2)
-            cv.circle(vis, (cx0, cy0), 3, (0, 0, 255), -1)
-            if MIRROR:
-                cv.putText(vis, "MIRROR: ON", (FRAME_W - 180, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 2)
+
+            # 총구 위치 표시
+            cv.drawMarker(vis, (MUZZLE_PX, MUZZLE_PY), (0,255,255), markerType=cv.MARKER_TILTED_CROSS, markerSize=24, thickness=2)
 
             if target is not None:
-                (bx, by, bw, bh) = target["bbox"]
-                (cx, cy) = target["center"]
-                area = target["area"]
-                circ = target["circularity"]
-                hull = target["hull"]
-
-                if ema_cx is None:
-                    ema_cx, ema_cy = cx, cy
-                else:
-                    ema_cx = int(SMOOTH_ALPHA * cx + (1 - SMOOTH_ALPHA) * ema_cx)
-                    ema_cy = int(SMOOTH_ALPHA * cy + (1 - SMOOTH_ALPHA) * ema_cy)
-
-                dx_px = ema_cx - cx0
-                dy_px = ema_cy - cy0
-
-                if abs(dx_px) < DEADZONE_PX:
-                    dx_px = 0
-                if abs(dy_px) < DEADZONE_PX:
-                    dy_px = 0
-
-                deg_x, deg_y = px_to_deg(dx_px, dy_px, FRAME_W, FRAME_H)
+                cx, cy = target["center"]
+                deg_x, deg_y = px_to_deg_with_muzzle(cx, cy, MUZZLE_PX, MUZZLE_PY, FRAME_W, FRAME_H)
                 dx_cm, dy_cm = angle_to_cm(deg_x, deg_y, RANGE_CM)
                 cmd_deg_x, cmd_deg_y = cm_to_motor_deg(dx_cm, dy_cm)
-
-                # --- 서보 기준 정조준 보정 적용 ---
                 servo_pan, servo_tilt = delta_to_servo_angles(cmd_deg_x, cmd_deg_y)
-                servo_pan  = PAN_OFFSET  + (servo_pan  - SERVO_CENTER_PAN)
-                servo_tilt = TILT_OFFSET + (servo_tilt - SERVO_CENTER_TILT)
-                servo_pan  = max(PAN_MIN,  min(PAN_MAX,  int(servo_pan)))
-                servo_tilt = max(TILT_MIN, min(TILT_MAX, int(servo_tilt)))
-
                 motors.send_servo(servo_pan, servo_tilt)
-
-                # --- 시각화 ---
-                cv.rectangle(vis, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
-                cv.circle(vis, (ema_cx, ema_cy), 5, (0, 0, 255), -1)
-                cv.drawContours(vis, [hull], -1, (255, 0, 255), 2)
-
-                y0 = 28
-                dy = 28
-                cv.putText(vis, f"area:{area}  circ:{circ:.3f}  score:{target['score']:.3f}",
-                           (bx, max(0, by - 10)), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv.putText(vis, f"offset_px:   ({dx_px:+d}, {dy_px:+d})",
-                           (10, y0), cv.FONT_HERSHEY_SIMPLEX, 0.7, (50, 220, 50), 2)
-                cv.putText(vis, f"offset_deg:  ({deg_x:+.2f}, {deg_y:+.2f})",
-                           (10, y0+dy), cv.FONT_HERSHEY_SIMPLEX, 0.7, (50, 220, 50), 2)
-                cv.putText(vis, f"offset_cm*:  ({dx_cm:+.1f}, {dy_cm:+.1f})  @R={RANGE_CM:.0f}cm",
-                           (10, y0+2*dy), cv.FONT_HERSHEY_SIMPLEX, 0.7, (50, 220, 50), 2)
-                cv.putText(vis, f"motor_cmd:   panΔ={cmd_deg_x:+d}°, tiltΔ={cmd_deg_y:+d}°",
-                           (10, y0+3*dy), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv.putText(vis, f"servo_out:   pan={servo_pan:3d}°, tilt={servo_tilt:3d}° (0~180)",
-                           (10, y0+4*dy), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv.circle(vis, (cx, cy), 6, (0,0,255), -1)
+                cv.putText(vis, f"deg_x={deg_x:.2f}, deg_y={deg_y:.2f}", (10,30), cv.FONT_HERSHEY_SIMPLEX, 0.6,(0,255,0),2)
+                cv.putText(vis, f"servo pan={servo_pan}, tilt={servo_tilt}", (10,60), cv.FONT_HERSHEY_SIMPLEX, 0.6,(0,255,255),2)
             else:
-                ema_cx = ema_cy = None
-                cv.putText(vis, "No target", (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv.putText(vis, "No target", (10,30), cv.FONT_HERSHEY_SIMPLEX, 0.8,(0,0,255),2)
 
-            now = time.time()
-            dt  = now - prev_t
-            prev_t = now
-            if dt > 0:
-                fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
-            cv.putText(vis, f"FPS: {fps:.1f}", (10, FRAME_H - 10),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
-            cv.imshow("frame", vis)
-            cv.imshow("mask", mask)
-            key = cv.waitKey(1) & 0xFF
-            if key == 27 or key == ord('q'):
-                break
+            now = time.time(); dt = now - prev_t; prev_t = now
+            if dt>0: fps = 0.9*fps + 0.1*(1.0/dt) if fps>0 else (1.0/dt)
+            cv.putText(vis, f"FPS:{fps:.1f}", (10, FRAME_H-10), cv.FONT_HERSHEY_SIMPLEX, 0.7,(255,255,0),2)
+            cv.imshow("frame", vis); cv.imshow("mask", mask)
+            key = cv.waitKey(1)&0xFF
+            if key==27 or key==ord('q'): break
     except KeyboardInterrupt:
         print("Interrupted.")
     finally:
-        cv.destroyAllWindows()
-        picam2.stop()
-        motors.close()
+        cv.destroyAllWindows(); picam2.stop(); motors.close()
 
 if __name__ == "__main__":
     main()
