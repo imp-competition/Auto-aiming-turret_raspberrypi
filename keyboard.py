@@ -26,8 +26,8 @@ CLOSE_ITERS = 2
 
 # 추적/모터
 SMOOTH_ALPHA = 0.4
-MIN_MOVE_DEG = 1.0
-DEADZONE_PX  = 8
+MIN_MOVE_DEG = 1.0        # <= 원본 유지 (아래 로직에선 사용하지 않음)
+DEADZONE_PX  = 8          # <= 원본 유지 (아래 로직에선 사용하지 않음)
 RANGE_CM     = 200.0
 H_CM_PER_DEG = 1.32
 V_CM_PER_DEG = 1.32
@@ -55,12 +55,10 @@ TILT_MIN, TILT_MAX = 75, 180
 W_CIRC  = 0.40
 W_COLOR = 0.60
 
-# 색 내부 가중 (S 최우선)
 WC_H = 0.15
 WC_S = 0.65
 WC_V = 0.20
 
-# 목표 색 구간
 H_LO, H_HI = 3.0, 11.0
 S_LO, S_HI = 180.0, 199.0
 V_LO, V_HI = 175.0, 199.0
@@ -70,26 +68,14 @@ S_SIGMA_OUT = 15.0
 V_SIGMA_OUT = 15.0
 
 # =========================================================
-# (추가) 런타임 튜닝 파라미터 & 영점
+# (추가) 런타임 튜닝 파라미터 (초기값은 원본 동작 훼손 없이 설정)
 # =========================================================
-# 숫자키로 조정되는 값 (초기값은 합리적인 기본값)
 KpX = 1.00   # 좌우 비례 이득
 KpY = 1.00   # 상하 비례 이득
 KvX = 0.30   # 좌우 속도 이득
 KvY = 0.30   # 상하 속도 이득
-MAX_STEP_DEG = 8  # 프레임당 최대 회전각(°)
-ALPHA_V = 0.6     # 속도 추정 EMA 계수
-
-# 영점 오프셋(초기엔 센터와 동일하게 시작)
-PAN_OFFSET_INIT  = SERVO_CENTER_PAN
-TILT_OFFSET_INIT = SERVO_CENTER_TILT
-PAN_OFFSET  = PAN_OFFSET_INIT
-TILT_OFFSET = TILT_OFFSET_INIT
-ADJ_STEP = 1  # u/d/r/l 한 번에 1°씩
-
-# 총구 기준(영상 좌표) – 필요 시 수정
-MUZZLE_PX = FRAME_W // 2
-MUZZLE_PY = int(FRAME_H * 0.83)
+MAX_STEP_DEG = 0        # 0 = 제한 없음 (9/0 키로 조절)
+ALPHA_V = 0.6           # 속도 추정 EMA
 
 # =========================================================
 # 마스크 생성 (빨강 계열 후보)
@@ -133,14 +119,10 @@ def circularity_from_contour(cnt):
     circ = 4.0 * math.pi * area / (perim * perim)
     return circ, area
 
-def px_to_deg_from_muzzle(tx, ty, mx, my, width, height):
-    dx_px = tx - mx
-    dy_px = ty - my
-    if abs(dx_px) < DEADZONE_PX: dx_px = 0
-    if abs(dy_px) < DEADZONE_PX: dy_px = 0
+def px_to_deg(dx_px, dy_px, width, height):
     deg_x = (dx_px / float(width))  * HFOV_DEG
     deg_y = (dy_px / float(height)) * VFOV_DEG
-    return deg_x, deg_y, dx_px, dy_px
+    return deg_x, deg_y
 
 def angle_to_cm(deg_x, deg_y, range_cm):
     dx_cm = range_cm * math.tan(math.radians(deg_x))
@@ -225,8 +207,8 @@ def pick_best_target(mask, frame_area_min, frame_area_max, circ_min, frame_bgr=N
 def delta_to_servo_angles(cmd_deg_x, cmd_deg_y):
     pan  = SERVO_CENTER_PAN  + SIGN_PAN  * cmd_deg_x
     tilt = SERVO_CENTER_TILT + SIGN_TILT * cmd_deg_y
-    pan  = max(PAN_MIN,  min(PAN_MAX,  int(pan)))
-    tilt = max(TILT_MIN, min(TILT_MAX, int(tilt)))
+    pan  = max(PAN_MIN,  min(PAN_MAX,  int(round(pan))))
+    tilt = max(TILT_MIN, min(TILT_MAX, int(round(tilt))))
     return pan, tilt
 
 # =========================================================
@@ -267,7 +249,6 @@ def draw_text(vis, text, org, color=(0,255,255), scale=0.7):
 # =========================================================
 def main():
     global KpX, KpY, KvX, KvY, MAX_STEP_DEG
-    global PAN_OFFSET, TILT_OFFSET
 
     motors = MotorUART(UART_PAN, UART_TILT, BAUDRATE, SER_TIMEOUT)
 
@@ -286,7 +267,7 @@ def main():
     prev_t = time.time()
     fps = 0.0
 
-    # 각속도 추정을 위한 상태
+    # 속도 추정 상태
     prev_deg_x = None
     prev_deg_y = None
     v_deg_x = 0.0
@@ -294,9 +275,9 @@ def main():
 
     try:
         while True:
-            # dt 먼저 확보 (제어용)
+            # dt
             now = time.time()
-            dt  = max(1e-3, now - prev_t)  # 최소 보호
+            dt  = max(1e-3, now - prev_t)
             prev_t = now
 
             frame_rgb = picam2.capture_array()
@@ -320,19 +301,21 @@ def main():
                 circ = target["circularity"]
                 hull = target["hull"]
 
-                # 타깃 중심 EMA(스무딩)
+                # 스무딩(EMA)
                 if ema_cx is None:
                     ema_cx, ema_cy = cx, cy
                 else:
                     ema_cx = int(SMOOTH_ALPHA * cx + (1 - SMOOTH_ALPHA) * ema_cx)
                     ema_cy = int(SMOOTH_ALPHA * cy + (1 - SMOOTH_ALPHA) * ema_cy)
 
-                # 총구 기준 오차 (deg) + 픽셀 오차
-                deg_x, deg_y, dx_px, dy_px = px_to_deg_from_muzzle(
-                    ema_cx, ema_cy, MUZZLE_PX, MUZZLE_PY, FRAME_W, FRAME_H
-                )
+                # 픽셀 오차 (데드존 적용 안 함)
+                dx_px = ema_cx - cx0
+                dy_px = ema_cy - cy0
 
-                # 각속도 추정 (deg/s) + EMA
+                # 각도 오차
+                deg_x, deg_y = px_to_deg(dx_px, dy_px, FRAME_W, FRAME_H)
+
+                # 각속도 추정 + EMA
                 if prev_deg_x is None:
                     prev_deg_x, prev_deg_y = deg_x, deg_y
                     est_vx = est_vy = 0.0
@@ -343,38 +326,22 @@ def main():
                 v_deg_x = ALPHA_V * v_deg_x + (1 - ALPHA_V) * est_vx
                 v_deg_y = ALPHA_V * v_deg_y + (1 - ALPHA_V) * est_vy
 
-                # 각도 오차 → 필요한 회전각(연속값)
-                # (cm로 갔다가 다시 deg로 가는 대신, 직접 탄젠트로 필요한 deg를 바로 근사)
-                need_x_deg = math.degrees(math.atan((RANGE_CM * math.tan(math.radians(deg_x))) / H_CM_PER_DEG / 57.295779513))
-                need_y_deg = math.degrees(math.atan((RANGE_CM * math.tan(math.radians(deg_y))) / V_CM_PER_DEG / 57.295779513))
+                # 각도 → 거리(cm) → 필요한 모터각(연속값)
+                dx_cm, dy_cm = angle_to_cm(deg_x, deg_y, RANGE_CM)
+                need_x_deg = dx_cm / H_CM_PER_DEG
+                need_y_deg = dy_cm / V_CM_PER_DEG
 
-                # 위치 + 속도 이득 (축별)
+                # 축별 위치+속도 결합
                 cmd_x = KpX * need_x_deg + KvX * v_deg_x
                 cmd_y = KpY * need_y_deg + KvY * v_deg_y
 
-                # 프레임당 최대 구동각 제한
-                cmd_x = max(-MAX_STEP_DEG, min(MAX_STEP_DEG, cmd_x))
-                cmd_y = max(-MAX_STEP_DEG, min(MAX_STEP_DEG, cmd_y))
+                # 프레임당 최대각 제한(기본 비활성: 0)
+                if MAX_STEP_DEG > 0:
+                    cmd_x = max(-MAX_STEP_DEG, min(MAX_STEP_DEG, cmd_x))
+                    cmd_y = max(-MAX_STEP_DEG, min(MAX_STEP_DEG, cmd_y))
 
-                # 최소 구동각 & 정수화
-                def quantize(v):
-                    s = 1 if v >= 0 else -1
-                    mag = abs(v)
-                    if mag < MIN_MOVE_DEG:
-                        return 0
-                    return int(round(s * mag))
-
-                cmd_deg_x = quantize(cmd_x)
-                cmd_deg_y = quantize(cmd_y)
-
-                # 서보 각 생성
-                servo_pan, servo_tilt = delta_to_servo_angles(cmd_deg_x, cmd_deg_y)
-
-                # 영점 오프셋 적용
-                servo_pan  = PAN_OFFSET  + (servo_pan  - SERVO_CENTER_PAN)
-                servo_tilt = TILT_OFFSET + (servo_tilt - SERVO_CENTER_TILT)
-                servo_pan  = max(PAN_MIN,  min(PAN_MAX,  int(servo_pan)))
-                servo_tilt = max(TILT_MIN, min(TILT_MAX, int(servo_tilt)))
+                # 절대 서보각 산출(정수화만 적용)
+                servo_pan, servo_tilt = delta_to_servo_angles(cmd_x, cmd_y)
 
                 motors.send_servo(servo_pan, servo_tilt)
 
@@ -387,18 +354,14 @@ def main():
                 dy = 26
                 draw_text(vis, f"area:{area}  circ:{circ:.3f}",
                           (bx, max(0, by - 10)), color=(0,255,0), scale=0.6)
-                draw_text(vis, f"offset_px(mu): ({dx_px:+d}, {dy_px:+d})", (10, y0), color=(50,220,50))
-                draw_text(vis, f"offset_deg:    ({deg_x:+.2f}, {deg_y:+.2f})", (10, y0+dy), color=(50,220,50))
-                draw_text(vis, f"cmdΔ: pan={cmd_deg_x:+d}°, tilt={cmd_deg_y:+d}°",
+                draw_text(vis, f"offset_px:   ({dx_px:+d}, {dy_px:+d})", (10, y0), color=(50,220,50))
+                draw_text(vis, f"offset_deg:  ({deg_x:+.2f}, {deg_y:+.2f})", (10, y0+dy), color=(50,220,50))
+                draw_text(vis, f"cmd(raw):    pan={cmd_x:+.2f}°, tilt={cmd_y:+.2f}°",
                           (10, y0+2*dy), color=(0,255,255))
-                draw_text(vis, f"servo_out:     pan={servo_pan:3d}°, tilt={servo_tilt:3d}°",
+                draw_text(vis, f"servo_out:   pan={servo_pan:3d}°, tilt={servo_tilt:3d}°",
                           (10, y0+3*dy), color=(0,255,255))
-
-                # 튜닝 HUD
-                draw_text(vis, f"KpX:{KpX:.2f} KvX:{KvX:.2f} | KpY:{KpY:.2f} KvY:{KvY:.2f} | MAX:{MAX_STEP_DEG}°  DZ:{DEADZONE_PX}px  MIN:{MIN_MOVE_DEG:.1f}°",
-                          (FRAME_W - 780, FRAME_H - 60), color=(200,220,255), scale=0.6)
-                draw_text(vis, f"ZERO pan:{PAN_OFFSET:+d}° tilt:{TILT_OFFSET:+d}° (step={ADJ_STEP}°)",
-                          (FRAME_W - 500, FRAME_H - 32), color=(200,200,255), scale=0.6)
+                draw_text(vis, f"KpX:{KpX:.2f} KvX:{KvX:.2f} | KpY:{KpY:.2f} KvY:{KvY:.2f} | MAX:{MAX_STEP_DEG}°",
+                          (FRAME_W - 650, FRAME_H - 30), color=(200,220,255), scale=0.6)
 
             else:
                 ema_cx = ema_cy = None
@@ -411,21 +374,13 @@ def main():
             cv.imshow("frame", vis)
             cv.imshow("mask", mask)
 
-            # 키 입력 처리
+            # 키 입력
             key = cv.waitKey(1) & 0xFF
             if key == 27 or key == ord('q'):
                 break
 
-            # --- 영점 조절 ---
-            if   key == ord('u'):  TILT_OFFSET -= ADJ_STEP
-            elif key == ord('d'):  TILT_OFFSET += ADJ_STEP
-            elif key == ord('r'):  PAN_OFFSET  += ADJ_STEP
-            elif key == ord('l'):  PAN_OFFSET  -= ADJ_STEP
-            elif key == ord('c'):
-                PAN_OFFSET, TILT_OFFSET = PAN_OFFSET_INIT, TILT_OFFSET_INIT
-
-            # --- 숫자키 튜닝 ---
-            elif key == ord('1'):  KpX = max(0.0, round(KpX - 0.05, 3))
+            # 숫자키 튜닝
+            if   key == ord('1'):  KpX = max(0.0, round(KpX - 0.05, 3))
             elif key == ord('2'):  KpX = round(KpX + 0.05, 3)
             elif key == ord('3'):  KpY = max(0.0, round(KpY - 0.05, 3))
             elif key == ord('4'):  KpY = round(KpY + 0.05, 3)
@@ -433,8 +388,8 @@ def main():
             elif key == ord('6'):  KvX = round(KvX + 0.05, 3)
             elif key == ord('7'):  KvY = max(0.0, round(KvY - 0.05, 3))
             elif key == ord('8'):  KvY = round(KvY + 0.05, 3)
-            elif key == ord('9'):  MAX_STEP_DEG = max(1, MAX_STEP_DEG - 1)
-            elif key == ord('0'):  MAX_STEP_DEG = min(30, MAX_STEP_DEG + 1)
+            elif key == ord('9'):  MAX_STEP_DEG = max(0, MAX_STEP_DEG - 1)   # 0이면 무제한
+            elif key == ord('0'):  MAX_STEP_DEG = min(60, MAX_STEP_DEG + 1)
 
     except KeyboardInterrupt:
         print("Interrupted.")
